@@ -1,12 +1,53 @@
+import threading
 import warnings
 
 from django.core.exceptions import ImproperlyConfigured
 from django.utils.module_loading import import_string
 
-from funcy import decorator, identity, memoize, omit, LazyObject
+from funcy import decorator, identity, memoize, omit
 import redis
 from redis.sentinel import Sentinel
 from .conf import settings
+
+
+_lazy_setup_lock = threading.Lock()
+
+
+def _lazy_setup(lazy):
+    # Morph `lazy` into the object returned by its init function. Guarded by a
+    # lock and made idempotent by popping `_init`, so concurrent first-access
+    # from threaded workers can't observe a half-morphed object. The lock lives
+    # at module scope (not on the instance) so it survives the morph, and we
+    # never route through `lazy._setup()` — once `__class__` is swapped that
+    # attribute is gone, which is the original race.
+    with _lazy_setup_lock:
+        init = lazy.__dict__.pop('_init', None)
+        if init is None:
+            return  # another thread already morphed us
+        wrapped = init()
+        object.__setattr__(lazy, '__dict__', wrapped.__dict__)
+        object.__setattr__(lazy, '__class__', wrapped.__class__)
+
+
+class LazyObject:
+    """A thread-safe lazy init object that rewrites itself on first access.
+
+    Drop-in for funcy.LazyObject. funcy's version swaps __class__ then __dict__
+    in __getattr__ without locking; under threaded workers two threads racing on
+    first access make one see a half-morphed object and raise
+    "'X' object has no attribute '_setup'". See _lazy_setup for the guard.
+    """
+
+    def __init__(self, init):
+        self.__dict__['_init'] = init
+
+    def __getattr__(self, name):
+        _lazy_setup(self)
+        return getattr(self, name)
+
+    def __setattr__(self, name, value):
+        _lazy_setup(self)
+        return setattr(self, name, value)
 
 
 @decorator
